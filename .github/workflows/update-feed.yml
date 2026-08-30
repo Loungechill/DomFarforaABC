@@ -1,0 +1,112 @@
+name: Update Dom Farfora ABC feed
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - filter_feed.py
+      - blocked_vendors.txt
+      - .github/workflows/update-feed.yml
+      - tests/**
+  schedule:
+    - cron: "17 */4 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dom-farfora-abc-feed-update
+  cancel-in-progress: true
+
+jobs:
+  update-feed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Build and validate ABC feed
+        run: |
+          set -o pipefail
+          python3 filter_feed.py \
+            --source "https://api.domfarfora.ru/bitrix/catalog_export/yandex-direct.xml" \
+            --stats-source "https://docs.google.com/spreadsheets/d/e/2PACX-1vRGIY-NLZaOAoB_4tqJYxtdMX6b5zgNrBeIBj3j-pIW3imbTTVijTHuGyrgO3OiKJkyE2EYWRda1Tt4/pub?gid=0&single=true&output=csv" \
+            --blacklist blocked_vendors.txt \
+            --output feed.xml \
+            | tee build_report.txt
+
+      - name: Publish stable release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view feed-latest >/dev/null 2>&1; then
+            gh release upload feed-latest feed.xml build_report.txt --clobber
+            gh release edit feed-latest \
+              --title "Dom Farfora ABC feed" \
+              --notes "Automatically regenerated every four hours from the source feed and published conversion statistics."
+          else
+            gh release create feed-latest feed.xml build_report.txt \
+              --title "Dom Farfora ABC feed" \
+              --notes "Automatically regenerated every four hours from the source feed and published conversion statistics."
+          fi
+
+      - name: Verify published release
+        run: |
+          RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/feed-latest/feed.xml"
+
+          curl -fL \
+            --retry 5 \
+            --retry-delay 3 \
+            --connect-timeout 20 \
+            --max-time 180 \
+            "${RELEASE_URL}?run=${GITHUB_RUN_ID}" \
+            -o feed.from-release.xml
+
+          cmp --silent feed.xml feed.from-release.xml
+
+          python3 - <<'PY'
+          import collections
+          import xml.etree.ElementTree as ET
+
+          tree = ET.parse("feed.from-release.xml")
+          root = tree.getroot()
+          assert root.tag.rsplit("}", 1)[-1] == "yml_catalog"
+
+          offers = next(
+              node for node in root.iter()
+              if node.tag.rsplit("}", 1)[-1] == "offers"
+          )
+          labels = collections.Counter()
+
+          for offer in offers:
+              custom_labels = [
+                  child.text
+                  for child in offer
+                  if child.tag.rsplit("}", 1)[-1] == "custom_label_0"
+              ]
+              assert len(custom_labels) == 1
+              assert custom_labels[0] in {"1", "2", "3"}
+              labels[custom_labels[0]] += 1
+
+          assert sum(labels.values()) == len(offers)
+          print(f"Published release validation: offers={len(offers)}, labels={dict(labels)}")
+          PY
+
+      - name: Record successful update
+        run: |
+          printf '%s\n' "$(date -u +'%Y-%m-%d %H:%M:%S UTC')" > last_success.txt
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add last_success.txt
+          git commit -m "chore: record successful ABC feed update" || exit 0
+          git push
+
